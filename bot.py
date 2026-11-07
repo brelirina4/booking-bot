@@ -1,819 +1,472 @@
-import calendar
+import os
+import json
 import logging
-import sqlite3
-from datetime import datetime, date, time, timedelta
-from pathlib import Path
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
-    ConversationHandler,
+    CallbackQueryHandler,
     MessageHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
 
-TOKEN = "9244559671:AAHIrntd4NqgsQ2noNfkpEZdmMt097J2XpY"
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-TIMEZONE = ZoneInfo("Europe/Minsk")
-DATABASE = Path(__file__).with_name("bookings.sqlite3")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATA_FILE = "data.json"
 
-ASK_NAME, ASK_PHONE, ADD_ADMIN = range(3)
+OWNER_ID = None
+ADMINS = set()
+BOOKINGS = []
+CLOSED_DAYS = set()
 
-OPEN_HOUR = 10
-CLOSE_HOUR = 18
-
-MONTHS = [
-    "", "Январь", "Февраль", "Март", "Апрель",
-    "Май", "Июнь", "Июль", "Август",
-    "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
-]
-
-logging.basicConfig(level=logging.WARNING)
+NAME, PHONE = range(2)
 
 
-def now():
-    return datetime.now(TIMEZONE)
+def load_data():
+    global OWNER_ID, ADMINS, BOOKINGS, CLOSED_DAYS
+
+    if not os.path.exists(DATA_FILE):
+        return
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        OWNER_ID = data.get("owner_id")
+        ADMINS = set(data.get("admins", []))
+        BOOKINGS = data.get("bookings", [])
+        CLOSED_DAYS = set(data.get("closed_days", []))
+    except Exception as error:
+        logger.error(f"Ошибка загрузки данных: {error}")
 
 
-def init_database():
-    with sqlite3.connect(DATABASE) as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS bookings (
-                slot TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+def save_data():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "owner_id": OWNER_ID,
+                    "admins": list(ADMINS),
+                    "bookings": BOOKINGS,
+                    "closed_days": list(CLOSED_DAYS),
+                },
+                file,
+                ensure_ascii=False,
+                indent=2,
             )
-        """)
-
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT
-            )
-        """)
-
-        try:
-            connection.execute(
-                "ALTER TABLE bookings ADD COLUMN name TEXT"
-            )
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            connection.execute(
-                "ALTER TABLE bookings ADD COLUMN phone TEXT"
-            )
-        except sqlite3.OperationalError:
-            pass
-
-
-def get_owner_id():
-    with sqlite3.connect(DATABASE) as connection:
-        row = connection.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            ("owner_id",),
-        ).fetchone()
-
-    return int(row[0]) if row else None
-
-
-def set_owner_id(user_id):
-    with sqlite3.connect(DATABASE) as connection:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO settings (key, value)
-            VALUES (?, ?)
-            """,
-            ("owner_id", str(user_id)),
-        )
-
-
-def get_admin_ids():
-    with sqlite3.connect(DATABASE) as connection:
-        row = connection.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            ("admins",),
-        ).fetchone()
-
-    if not row or not row[0]:
-        return []
-
-    return [
-        int(admin_id)
-        for admin_id in row[0].split(",")
-        if admin_id.strip().isdigit()
-    ]
-
-
-def add_admin_id(user_id):
-    admins = get_admin_ids()
-
-    if user_id not in admins:
-        admins.append(user_id)
-
-    with sqlite3.connect(DATABASE) as connection:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO settings (key, value)
-            VALUES (?, ?)
-            """,
-            ("admins", ",".join(str(admin_id) for admin_id in admins)),
-        )
-
-
-def remove_admin_id(user_id):
-    admins = get_admin_ids()
-
-    if user_id in admins:
-        admins.remove(user_id)
-
-    with sqlite3.connect(DATABASE) as connection:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO settings (key, value)
-            VALUES (?, ?)
-            """,
-            ("admins", ",".join(str(admin_id) for admin_id in admins)),
-        )
+    except Exception as error:
+        logger.error(f"Ошибка сохранения данных: {error}")
 
 
 def is_admin(user_id):
-    owner_id = get_owner_id()
-    return user_id == owner_id or user_id in get_admin_ids()
+    return user_id == OWNER_ID or user_id in ADMINS
 
 
-def save_user(update: Update):
-    user = update.effective_user
+def get_dates():
+    dates = []
+    today = datetime.now().date()
 
-    with sqlite3.connect(DATABASE) as connection:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO users (
-                user_id, username, first_name
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                user.id,
-                (user.username or "").lower(),
-                user.first_name or "",
-            ),
-        )
+    for day in range(14):
+        date = today + timedelta(days=day)
+        dates.append(date)
+
+    return dates
 
 
-def find_user_by_username(username):
-    username = username.replace("@", "").strip().lower()
-
-    with sqlite3.connect(DATABASE) as connection:
-        row = connection.execute(
-            "SELECT user_id FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
-
-    return int(row[0]) if row else None
-
-
-def booked_slots():
-    with sqlite3.connect(DATABASE) as connection:
-        rows = connection.execute(
-            "SELECT slot FROM bookings"
-        ).fetchall()
-    return {row[0] for row in rows}
-
-
-def available_slots(day):
-    occupied = booked_slots()
-    current = now()
-    result = []
-
-    for hour in range(OPEN_HOUR, CLOSE_HOUR):
-        slot = datetime.combine(
-            day, time(hour=hour), tzinfo=TIMEZONE
-        )
-        if slot > current and slot.isoformat() not in occupied:
-            result.append(slot)
-
-    return result
-
-
-def month_keyboard(year, month):
-    current = now().date()
-    last_day = current + timedelta(days=90)
-
-    rows = [
-        [InlineKeyboardButton(
-            f"{MONTHS[month]} {year}",
-            callback_data="ignore",
-        )],
-        [
-            InlineKeyboardButton(label, callback_data="ignore")
-            for label in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        ],
+def date_text(date):
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
     ]
 
-    for week in calendar.monthcalendar(year, month):
-        buttons = []
-
-        for number in week:
-            label = " "
-            callback = "ignore"
-
-            if number:
-                day = date(year, month, number)
-
-                if current <= day <= last_day:
-                    if available_slots(day):
-                        label = str(number)
-                        callback = f"day|{day.isoformat()}"
-                    else:
-                        label = "×"
-                else:
-                    label = "·"
-
-            buttons.append(InlineKeyboardButton(
-                label, callback_data=callback
-            ))
-
-        rows.append(buttons)
-
-    navigation = []
-
-    if (year, month) > (current.year, current.month):
-        previous = (
-            (year - 1, 12) if month == 1 else (year, month - 1)
-        )
-        navigation.append(InlineKeyboardButton(
-            "←",
-            callback_data=f"month|{previous[0]}|{previous[1]}",
-        ))
-
-    if (year, month) < (last_day.year, last_day.month):
-        following = (
-            (year + 1, 1) if month == 12 else (year, month + 1)
-        )
-        navigation.append(InlineKeyboardButton(
-            "→",
-            callback_data=f"month|{following[0]}|{following[1]}",
-        ))
-
-    if navigation:
-        rows.append(navigation)
-
-    return InlineKeyboardMarkup(rows)
-
-
-def hours_keyboard(day):
-    slots = available_slots(day)
-    buttons = [
-        InlineKeyboardButton(
-            slot.strftime("%H:%M"),
-            callback_data=f"slot|{slot.isoformat()}",
-        )
-        for slot in slots
+    weekdays = [
+        "Понедельник", "Вторник", "Среда", "Четверг",
+        "Пятница", "Суббота", "Воскресенье"
     ]
 
-    rows = [
-        buttons[index:index + 3]
-        for index in range(0, len(buttons), 3)
-    ]
-
-    rows.append([InlineKeyboardButton(
-        "Назад к календарю",
-        callback_data=f"month|{day.year}|{day.month}",
-    )])
-
-    return InlineKeyboardMarkup(rows)
+    return f"{weekdays[date.weekday()]}, {date.day} {months[date.month]}"
 
 
-def start_keyboard(user_id):
-    current = now().date()
-    owner_id = get_owner_id()
+def get_free_times(date):
+    if date.isoformat() in CLOSED_DAYS:
+        return []
 
-    month_menu = month_keyboard(current.year, current.month)
-    rows = [list(row) for row in month_menu.inline_keyboard]
+    booked_times = []
 
-    if owner_id == user_id:
-        rows.append([
-            InlineKeyboardButton(
-                "Панель владельца",
-                callback_data="owner_panel",
-            )
-        ])
+    for booking in BOOKINGS:
+        if booking["date"] == date.isoformat():
+            booked_times.append(booking["time"])
 
-    return InlineKeyboardMarkup(rows)
+    free_times = []
+
+    for hour in range(10, 20):
+        for minutes in [0, 30]:
+            time = f"{hour:02d}:{minutes:02d}"
+
+            if time not in booked_times:
+                free_times.append(time)
+
+    return free_times
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update)
+    user = update.effective_user
+
+    if OWNER_ID is None:
+        OWNER_ID = user.id
+        save_data()
+
+        await update.message.reply_text(
+            f"Привет, {user.first_name}!\n\n"
+            "Ты назначен владельцем бота."
+        )
+
+    keyboard = []
+
+    if is_admin(user.id):
+        keyboard.append(
+            [InlineKeyboardButton("Панель владельца", callback_data="owner_panel")]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("Записаться", callback_data="book")]
+    )
 
     await update.message.reply_text(
-        "Выберите дату записи.\n"
-        "Время — Минск. Длительность — 1 час.\n"
-        "× — свободного времени нет; · — дата недоступна.",
-        reply_markup=start_keyboard(update.effective_user.id),
+        "Привет! Выбери действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    dates = get_dates()
+    keyboard = []
+
+    for date in dates[:7]:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    date_text(date),
+                    callback_data=f"date_{date.isoformat()}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("Следующие дни", callback_data="more_dates")]
+    )
+
+    await query.message.reply_text(
+        "Выбери день:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def more_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    dates = get_dates()
+    keyboard = []
+
+    for date in dates[7:]:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    date_text(date),
+                    callback_data=f"date_{date.isoformat()}",
+                )
+            ]
+        )
+
+    await query.message.reply_text(
+        "Выбери день:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    date_string = query.data.replace("date_", "")
+    date = datetime.strptime(date_string, "%Y-%m-%d").date()
+
+    free_times = get_free_times(date)
+
+    if not free_times:
+        await query.message.reply_text(
+            "На этот день нет свободного времени."
+        )
+        return
+
+    keyboard = []
+
+    for time in free_times:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    time,
+                    callback_data=f"time_{date_string}_{time}",
+                )
+            ]
+        )
+
+    await query.message.reply_text(
+        f"Выбери время на {date_text(date)}:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.replace("time_", "")
+    date_string, time = data.split("_")
+
+    context.user_data["date"] = date_string
+    context.user_data["time"] = time
+
+    await query.message.reply_text("Напиши своё имя:")
+
+    return NAME
+
+
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text
+
+    await update.message.reply_text("Теперь отправь свой номер телефона:")
+
+    return PHONE
+
+
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    booking = {
+        "user_id": user.id,
+        "username": user.username,
+        "name": context.user_data["name"],
+        "phone": update.message.text,
+        "date": context.user_data["date"],
+        "time": context.user_data["time"],
+    }
+
+    BOOKINGS.append(booking)
+    save_data()
+
+    date = datetime.strptime(booking["date"], "%Y-%m-%d").date()
+
+    await update.message.reply_text(
+        f"✅ Запись создана!\n\n"
+        f"Имя: {booking['name']}\n"
+        f"Телефон: {booking['phone']}\n"
+        f"Дата: {date_text(date)}\n"
+        f"Время: {booking['time']}"
+    )
+
+    notification = (
+        f"Новая запись!\n\n"
+        f"Имя: {booking['name']}\n"
+        f"Телефон: {booking['phone']}\n"
+        f"Дата: {date_text(date)}\n"
+        f"Время: {booking['time']}\n"
+        f"Telegram: @{user.username}" if user.username else ""
+    )
+
+    if OWNER_ID:
+        try:
+            await context.bot.send_message(OWNER_ID, notification)
+        except Exception as error:
+            logger.error(f"Не удалось отправить уведомление владельцу: {error}")
+
+    for admin_id in ADMINS:
+        try:
+            await context.bot.send_message(admin_id, notification)
+        except Exception as error:
+            logger.error(f"Не удалось отправить уведомление админу: {error}")
+
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Действие отменено.")
+    return ConversationHandler.END
 
 
 async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    owner_id = get_owner_id()
+    user_id = update.effective_user.id
 
-    if owner_id != update.effective_user.id:
-        await query.edit_message_text(
-            "Эта панель доступна только владельцу."
-        )
+    if not is_admin(user_id):
+        await query.message.reply_text("У тебя нет доступа к панели владельца.")
         return
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "📋 Все записи",
-            callback_data="all_bookings",
-        )],
-        [InlineKeyboardButton(
-            "➕ Добавить админа",
-            callback_data="add_admin",
-        )],
-        [InlineKeyboardButton(
-            "👥 Список админов",
-            callback_data="admins_list",
-        )],
-        [InlineKeyboardButton(
-            "📅 Вернуться к календарю",
-            callback_data="back_to_start",
-        )],
-    ])
+    keyboard = [
+        [InlineKeyboardButton("Все записи", callback_data="all_bookings")],
+        [InlineKeyboardButton("Добавить админа", callback_data="add_admin")],
+        [InlineKeyboardButton("Список админов", callback_data="admin_list")],
+        [InlineKeyboardButton("Вернуться к календарю", callback_data="book")],
+    ]
 
-    await query.edit_message_text(
-        "Панель владельца.\n\n"
-        "Выбери действие:",
-        reply_markup=keyboard,
+    await query.message.reply_text(
+        "Панель владельца:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
-
-async def panel_all_bookings(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    owner_id = get_owner_id()
-
-    if owner_id != update.effective_user.id:
-        await query.edit_message_text(
-            "Эта панель доступна только владельцу."
-        )
-        return
-
-    with sqlite3.connect(DATABASE) as connection:
-        rows = connection.execute(
-            """
-            SELECT slot, name, phone, user_id
-            FROM bookings
-            ORDER BY slot
-            """
-        ).fetchall()
-
-    if not rows:
-        await query.edit_message_text(
-            "📋 Записей пока нет.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "← Назад",
-                    callback_data="owner_panel",
-                )]
-            ]),
-        )
-        return
-
-    text = "📋 Все записи:\n\n"
-
-    for slot, name, phone, user_id in rows:
-        booking_time = datetime.fromisoformat(slot)
-        text += (
-            f"📅 {booking_time.strftime('%d.%m.%Y')}\n"
-            f"🕒 {booking_time.strftime('%H:%M')} — Минск\n"
-            f"👤 Имя: {name or 'не указано'}\n"
-            f"📞 Телефон: {phone or 'не указан'}\n"
-            f"Telegram ID: {user_id}\n\n"
-        )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "← Назад",
-                callback_data="owner_panel",
-            )]
-        ]),
-    )
-
-
-async def panel_admins_list(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    owner_id = get_owner_id()
-
-    if owner_id != update.effective_user.id:
-        await query.edit_message_text(
-            "Эта панель доступна только владельцу."
-        )
-        return
-
-    admins = get_admin_ids()
-
-    text = "👥 Админы:\n\n"
-
-    if admins:
-        for admin_id in admins:
-            text += f"Telegram ID: {admin_id}\n"
-    else:
-        text += "Пока нет админов.\n"
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "← Назад",
-                callback_data="owner_panel",
-            )]
-        ]),
-    )
-
-
-async def start_add_admin(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    owner_id = get_owner_id()
-
-    if owner_id != update.effective_user.id:
-        await query.edit_message_text(
-            "Добавлять админов может только владелец."
-        )
-        return ConversationHandler.END
-
-    await query.edit_message_text(
-        "Отправь @username человека, которого хочешь сделать админом.\n\n"
-        "Например:\n"
-        "@anna\n\n"
-        "Важно: человек сначала должен открыть этого бота\n"
-        "и нажать Start."
-    )
-
-    return ADD_ADMIN
-
-
-async def save_new_admin(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    username = update.message.text.strip()
-    user_id = find_user_by_username(username)
-
-    if not user_id:
-        await update.message.reply_text(
-            "Я не нашёл этого человека.\n\n"
-            "Попроси его открыть бота и нажать Start,\n"
-            "а потом отправь его @username ещё раз."
-        )
-        return ADD_ADMIN
-
-    add_admin_id(user_id)
-
-    await update.message.reply_text(
-        "✅ Админ добавлен!\n\n"
-        f"Telegram ID: {user_id}\n\n"
-        "Теперь он будет получать уведомления о записях\n"
-        "и сможет открывать /bookings."
-    )
-
-    return ConversationHandler.END
-
-
-async def handle_button(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-    action = parts[0]
-
-    if action == "ignore":
-        return
-
-    if action == "back_to_start":
-        await query.edit_message_text(
-            "Выберите дату записи.\n"
-            "× — свободного времени нет; · — дата недоступна.",
-            reply_markup=start_keyboard(update.effective_user.id),
-        )
-        return
-
-    if action == "month":
-        year, month = int(parts[1]), int(parts[2])
-
-        await query.edit_message_text(
-            "Выберите дату записи.\n"
-            "× — свободного времени нет; · — дата недоступна.",
-            reply_markup=month_keyboard(year, month),
-        )
-
-    elif action == "day":
-        day = date.fromisoformat(parts[1])
-
-        await query.edit_message_text(
-            f"Свободное время на {day.strftime('%d.%m.%Y')}.\n"
-            "Часовой пояс — Минск.",
-            reply_markup=hours_keyboard(day),
-        )
-
-    elif action == "slot":
-        slot = datetime.fromisoformat(parts[1])
-
-        if slot not in available_slots(slot.date()):
-            await query.edit_message_text(
-                "Это время уже недоступно. Выберите другое.",
-                reply_markup=hours_keyboard(slot.date()),
-            )
-            return
-
-        await query.edit_message_text(
-            f"Подтвердить запись на "
-            f"{slot.strftime('%d.%m.%Y в %H:%M')}?\n"
-            "Длительность — 1 час. Время — Минск.\n"
-            "До подтверждения место не забронировано.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "Подтвердить запись",
-                    callback_data=f"book|{slot.isoformat()}",
-                )],
-                [InlineKeyboardButton(
-                    "Выбрать другое время",
-                    callback_data=f"day|{slot.date().isoformat()}",
-                )],
-            ]),
-        )
-
-
-async def start_booking(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-    slot = datetime.fromisoformat(parts[1])
-
-    context.user_data["pending_slot"] = slot.isoformat()
-
-    await query.edit_message_text(
-        f"Запись на {slot.strftime('%d.%m.%Y в %H:%M')}.\n\n"
-        "Как тебя зовут?\n"
-        "Напиши имя одним сообщением."
-    )
-
-    return ASK_NAME
-
-
-async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["client_name"] = update.message.text.strip()
-
-    await update.message.reply_text(
-        "Спасибо! Теперь отправь номер телефона.\n\n"
-        "Например: +7 900 123-45-67"
-    )
-
-    return ASK_PHONE
-
-
-async def save_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    slot_iso = context.user_data.get("pending_slot")
-
-    if not slot_iso:
-        await update.message.reply_text("Начните запись заново: /start")
-        return ConversationHandler.END
-
-    slot = datetime.fromisoformat(slot_iso)
-    current = now()
-
-    valid = (
-        current.date() <= slot.date()
-        <= current.date() + timedelta(days=90)
-        and slot > current
-        and OPEN_HOUR <= slot.hour < CLOSE_HOUR
-        and slot.minute == 0
-        and slot.second == 0
-    )
-
-    if not valid:
-        await update.message.reply_text(
-            "Это время уже недоступно. Начните заново: /start"
-        )
-        return ConversationHandler.END
-
-    try:
-        with sqlite3.connect(DATABASE) as connection:
-            connection.execute(
-                """
-                INSERT INTO bookings (
-                    slot, user_id, created_at, name, phone
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    slot_iso,
-                    update.effective_user.id,
-                    current.isoformat(),
-                    context.user_data["client_name"],
-                    phone,
-                ),
-            )
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(
-            "Это время уже заняли. Выберите другое: /start"
-        )
-        return ConversationHandler.END
-
-    notification_text = (
-        "🔔 Новая запись!\n\n"
-        f"📅 Дата: {slot.strftime('%d.%m.%Y')}\n"
-        f"🕒 Время: {slot.strftime('%H:%M')} — Минск\n"
-        f"👤 Имя: {context.user_data['client_name']}\n"
-        f"📞 Телефон: {phone}\n"
-        f"Telegram ID: {update.effective_user.id}"
-    )
-
-    admins = get_admin_ids()
-    owner_id = get_owner_id()
-
-    if owner_id and owner_id not in admins:
-        admins.append(owner_id)
-
-    for admin_id in admins:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=notification_text,
-            )
-        except Exception:
-            pass
-
-    await update.message.reply_text(
-        "✅ Запись сохранена!\n\n"
-        "Дата: " + slot.strftime("%d.%m.%Y") + "\n"
-        "Время: " + slot.strftime("%H:%M") + " — Минск\n"
-        "Имя: " + context.user_data["client_name"] + "\n"
-        "Телефон: " + phone + "\n\n"
-        "Это учебная запись, не запись в настоящий салон."
-    )
-
-    return ConversationHandler.END
 
 
 async def all_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Эта команда доступна только владельцу и админам."
-        )
+    query = update.callback_query
+    await query.answer()
+
+    if not BOOKINGS:
+        await query.message.reply_text("Записей пока нет.")
         return
 
-    with sqlite3.connect(DATABASE) as connection:
-        rows = connection.execute(
-            """
-            SELECT slot, name, phone, user_id
-            FROM bookings
-            ORDER BY slot
-            """
-        ).fetchall()
+    text = "Все записи:\n\n"
 
-    if not rows:
-        await update.message.reply_text("Записей пока нет.")
-        return
+    for index, booking in enumerate(BOOKINGS, start=1):
+        date = datetime.strptime(booking["date"], "%Y-%m-%d").date()
 
-    text = "📋 Все записи:\n\n"
-
-    for slot, name, phone, user_id in rows:
-        booking_time = datetime.fromisoformat(slot)
         text += (
-            f"📅 {booking_time.strftime('%d.%m.%Y')}\n"
-            f"🕒 {booking_time.strftime('%H:%M')} — Минск\n"
-            f"👤 Имя: {name or 'не указано'}\n"
-            f"📞 Телефон: {phone or 'не указан'}\n"
-            f"Telegram ID: {user_id}\n\n"
+            f"{index}. {booking['name']}\n"
+            f"Телефон: {booking['phone']}\n"
+            f"Дата: {date_text(date)}\n"
+            f"Время: {booking['time']}\n\n"
         )
 
-    await update.message.reply_text(text)
+    await query.message.reply_text(text)
 
 
-async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    owner_id = get_owner_id()
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    if owner_id is not None:
+    await query.message.reply_text(
+        "Отправь @username человека, которого хочешь сделать админом."
+    )
+
+    return "WAIT_USERNAME"
+
+
+async def get_admin_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip()
+
+    if not username.startswith("@"):
         await update.message.reply_text(
-            "Владелец уже назначен."
+            "Отправь username в формате @username."
         )
-        return
-
-    set_owner_id(update.effective_user.id)
+        return "WAIT_USERNAME"
 
     await update.message.reply_text(
-        "Ты назначен владельцем бота.\n\n"
-        "Открой /start и нажми «Панель владельца»,\n"
-        "чтобы добавить админов."
+        "Попроси этого человека открыть бота и нажать Start.\n\n"
+        "После этого снова нажми «Добавить админа» и отправь его @username."
     )
+
+    return ConversationHandler.END
+
+
+async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not ADMINS:
+        await query.message.reply_text("Админов пока нет.")
+        return
+
+    text = "Админы:\n\n"
+
+    for admin_id in ADMINS:
+        text += f"ID: {admin_id}\n"
+
+    await query.message.reply_text(text)
+
+
+async def setadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    if OWNER_ID is None:
+        OWNER_ID = user.id
+        save_data()
+
+        await update.message.reply_text("Ты назначен владельцем бота.")
+        return
+
+    await update.message.reply_text("Владелец уже назначен.")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+
+    if data == "book":
+        await book(update, context)
+
+    elif data == "more_dates":
+        await more_dates(update, context)
+
+    elif data.startswith("date_"):
+        await choose_date(update, context)
+
+    elif data.startswith("time_"):
+        await choose_time(update, context)
+
+    elif data == "owner_panel":
+        await owner_panel(update, context)
+
+    elif data == "all_bookings":
+        await all_bookings(update, context)
+
+    elif data == "add_admin":
+        await add_admin(update, context)
+
+    elif data == "admin_list":
+        await admin_list(update, context)
 
 
 def main():
-    init_database()
+    load_data()
 
-    admin_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                start_add_admin,
-                pattern=r"^add_admin$",
-            )
-        ],
-        states={
-            ADD_ADMIN: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    save_new_admin,
-                )
-            ],
-        },
-        fallbacks=[CommandHandler("start", start)],
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setadmin", setadmin))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
     conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                start_booking,
-                pattern=r"^book\|",
-            )
-        ],
+        entry_points=[CallbackQueryHandler(choose_time, pattern="^time_")],
         states={
-            ASK_NAME: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    save_name,
-                )
-            ],
-            ASK_PHONE: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    save_phone,
-                )
-            ],
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bookings", all_bookings))
-    app.add_handler(CommandHandler("setadmin", set_admin))
-    app.add_handler(admin_handler)
-    app.add_handler(conv_handler)
-    app.add_handler(
-        CallbackQueryHandler(
-            owner_panel,
-            pattern=r"^owner_panel$",
+    application.add_handler(conv_handler)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            get_admin_username,
         )
     )
-    app.add_handler(
-        CallbackQueryHandler(
-            panel_all_bookings,
-            pattern=r"^all_bookings$",
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            panel_admins_list,
-            pattern=r"^admins_list$",
-        )
-    )
-    app.add_handler(CallbackQueryHandler(handle_button))
-    app.run_polling()
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
