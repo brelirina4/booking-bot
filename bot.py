@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import calendar
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,7 +10,6 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -34,8 +33,6 @@ OWNER_ID = None
 ADMINS = set()
 BOOKINGS = []
 CLOSED_DAYS = set()
-
-NAME, PHONE = range(2)
 
 
 def load_data():
@@ -138,40 +135,6 @@ def build_calendar(year, month):
     return InlineKeyboardMarkup(keyboard)
 
 
-async def show_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    now = datetime.now()
-    year = now.year
-    month = now.month
-
-    await query.message.reply_text(
-        "Выбери дату:",
-        reply_markup=build_calendar(year, month),
-    )
-
-
-async def change_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data.replace("calendar_", "")
-    year, month = map(int, data.split("_"))
-
-    if month < 1:
-        month = 12
-        year -= 1
-
-    elif month > 12:
-        month = 1
-        year += 1
-
-    await query.edit_message_reply_markup(
-        reply_markup=build_calendar(year, month)
-    )
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global OWNER_ID
 
@@ -212,6 +175,26 @@ async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(
         "Выбери дату:",
         reply_markup=build_calendar(now.year, now.month),
+    )
+
+
+async def change_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.replace("calendar_", "")
+    year, month = map(int, data.split("_"))
+
+    if month < 1:
+        month = 12
+        year -= 1
+
+    elif month > 12:
+        month = 1
+        year += 1
+
+    await query.edit_message_reply_markup(
+        reply_markup=build_calendar(year, month)
     )
 
 
@@ -268,38 +251,44 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data.replace("time_", "")
-    date_string, time = data.split("_")
+    date_string, time = data.rsplit("_", 1)
 
-    context.user_data["date"] = date_string
-    context.user_data["time"] = time
+    context.user_data["booking_date"] = date_string
+    context.user_data["booking_time"] = time
+    context.user_data["booking_step"] = "name"
 
     await query.message.reply_text("Напиши своё имя:")
 
-    return NAME
-
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
+    if context.user_data.get("booking_step") != "name":
+        return
+
+    context.user_data["booking_name"] = update.message.text
+    context.user_data["booking_step"] = "phone"
 
     await update.message.reply_text("Теперь отправь свой номер телефона:")
 
-    return PHONE
-
 
 async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("booking_step") != "phone":
+        return
+
     user = update.effective_user
 
     booking = {
         "user_id": user.id,
         "username": user.username,
-        "name": context.user_data["name"],
+        "name": context.user_data["booking_name"],
         "phone": update.message.text,
-        "date": context.user_data["date"],
-        "time": context.user_data["time"],
+        "date": context.user_data["booking_date"],
+        "time": context.user_data["booking_time"],
     }
 
     BOOKINGS.append(booking)
     save_data()
+
+    context.user_data["booking_step"] = None
 
     date = datetime.strptime(booking["date"], "%Y-%m-%d").date()
 
@@ -333,13 +322,6 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(admin_id, notification)
         except Exception as error:
             logger.error(f"Не удалось отправить уведомление админу: {error}")
-
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Действие отменено.")
-    return ConversationHandler.END
 
 
 async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,26 +374,29 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    context.user_data["admin_step"] = "username"
+
     await query.message.reply_text(
         "Отправь @username человека, которого хочешь сделать админом."
     )
 
-    return "WAIT_USERNAME"
-
 
 async def get_admin_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("admin_step") != "username":
+        return
+
     username = update.message.text.strip()
 
     if not username.startswith("@"):
         await update.message.reply_text("Отправь username в формате @username.")
-        return "WAIT_USERNAME"
+        return
+
+    context.user_data["admin_step"] = None
 
     await update.message.reply_text(
         "Попроси этого человека открыть бота и нажать Start.\n\n"
         "После этого снова нажми «Добавить админа» и отправь его @username."
     )
-
-    return ConversationHandler.END
 
 
 async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -458,6 +443,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("date_"):
         await choose_date(update, context)
 
+    elif data.startswith("time_"):
+        await choose_time(update, context)
+
     elif data == "owner_panel":
         await owner_panel(update, context)
 
@@ -483,17 +471,19 @@ def main():
     application.add_handler(CommandHandler("setadmin", setadmin))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(choose_time, pattern="^time_")],
-        states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            get_name,
+        )
     )
 
-    application.add_handler(conv_handler)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            get_phone,
+        )
+    )
 
     application.add_handler(
         MessageHandler(
