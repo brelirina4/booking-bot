@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import calendar
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -77,50 +78,98 @@ def is_admin(user_id):
     return user_id == OWNER_ID or user_id in ADMINS
 
 
-def get_dates():
-    dates = []
-    today = datetime.now().date()
-
-    for day in range(14):
-        dates.append(today + timedelta(days=day))
-
-    return dates
-
-
-def date_text(date):
+def get_month_title(year, month):
     months = [
-        "января", "февраля", "марта", "апреля", "мая", "июня",
-        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
     ]
 
-    weekdays = [
-        "Понедельник", "Вторник", "Среда", "Четверг",
-        "Пятница", "Суббота", "Воскресенье"
-    ]
-
-    return f"{weekdays[date.weekday()]}, {date.day} {months[date.month]}"
+    return f"{months[month - 1]} {year}"
 
 
-def get_free_times(date):
-    if date.isoformat() in CLOSED_DAYS:
-        return []
+def build_calendar(year, month):
+    keyboard = []
 
-    booked_times = [
-        booking["time"]
-        for booking in BOOKINGS
-        if booking["date"] == date.isoformat()
-    ]
+    keyboard.append(
+        [
+            InlineKeyboardButton("←", callback_data=f"calendar_{year}_{month - 1}"),
+            InlineKeyboardButton(get_month_title(year, month), callback_data="ignore"),
+            InlineKeyboardButton("→", callback_data=f"calendar_{year}_{month + 1}"),
+        ]
+    )
 
-    free_times = []
+    keyboard.append(
+        [
+            InlineKeyboardButton("Пн", callback_data="ignore"),
+            InlineKeyboardButton("Вт", callback_data="ignore"),
+            InlineKeyboardButton("Ср", callback_data="ignore"),
+            InlineKeyboardButton("Чт", callback_data="ignore"),
+            InlineKeyboardButton("Пт", callback_data="ignore"),
+            InlineKeyboardButton("Сб", callback_data="ignore"),
+            InlineKeyboardButton("Вс", callback_data="ignore"),
+        ]
+    )
 
-    for hour in range(10, 20):
-        for minutes in [0, 30]:
-            time = f"{hour:02d}:{minutes:02d}"
+    month_calendar = calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)
 
-            if time not in booked_times:
-                free_times.append(time)
+    for week in month_calendar:
+        row = []
 
-    return free_times
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+                continue
+
+            date = datetime(year, month, day).date()
+
+            if date < datetime.now().date():
+                row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+                continue
+
+            row.append(
+                InlineKeyboardButton(
+                    str(day),
+                    callback_data=f"date_{date.isoformat()}",
+                )
+            )
+
+        keyboard.append(row)
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def show_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    now = datetime.now()
+    year = now.year
+    month = now.month
+
+    await query.message.reply_text(
+        "Выбери дату:",
+        reply_markup=build_calendar(year, month),
+    )
+
+
+async def change_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.replace("calendar_", "")
+    year, month = map(int, data.split("_"))
+
+    if month < 1:
+        month = 12
+        year -= 1
+
+    elif month > 12:
+        month = 1
+        year += 1
+
+    await query.edit_message_reply_markup(
+        reply_markup=build_calendar(year, month)
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -158,49 +207,11 @@ async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    dates = get_dates()
-    keyboard = []
-
-    for date in dates[:7]:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    date_text(date),
-                    callback_data=f"date_{date.isoformat()}",
-                )
-            ]
-        )
-
-    keyboard.append(
-        [InlineKeyboardButton("Следующие дни", callback_data="more_dates")]
-    )
+    now = datetime.now()
 
     await query.message.reply_text(
-        "Выбери день:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def more_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    dates = get_dates()
-    keyboard = []
-
-    for date in dates[7:]:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    date_text(date),
-                    callback_data=f"date_{date.isoformat()}",
-                )
-            ]
-        )
-
-    await query.message.reply_text(
-        "Выбери день:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "Выбери дату:",
+        reply_markup=build_calendar(now.year, now.month),
     )
 
 
@@ -211,26 +222,43 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_string = query.data.replace("date_", "")
     date = datetime.strptime(date_string, "%Y-%m-%d").date()
 
-    free_times = get_free_times(date)
-
-    if not free_times:
-        await query.message.reply_text("На этот день нет свободного времени.")
+    if date.isoformat() in CLOSED_DAYS:
+        await query.message.reply_text("Этот день закрыт для записи.")
         return
+
+    booked_times = [
+        booking["time"]
+        for booking in BOOKINGS
+        if booking["date"] == date.isoformat()
+    ]
 
     keyboard = []
 
-    for time in free_times:
-        keyboard.append(
-            [
+    for hour in range(10, 20):
+        row = []
+
+        for minutes in [0, 30]:
+            time = f"{hour:02d}:{minutes:02d}"
+
+            if time in booked_times:
+                continue
+
+            row.append(
                 InlineKeyboardButton(
                     time,
                     callback_data=f"time_{date_string}_{time}",
                 )
-            ]
-        )
+            )
+
+        if row:
+            keyboard.append(row)
+
+    if not keyboard:
+        await query.message.reply_text("На этот день нет свободного времени.")
+        return
 
     await query.message.reply_text(
-        f"Выбери время на {date_text(date)}:",
+        f"Выбери время на {date.strftime('%d.%m.%Y')}:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -279,7 +307,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Запись создана!\n\n"
         f"Имя: {booking['name']}\n"
         f"Телефон: {booking['phone']}\n"
-        f"Дата: {date_text(date)}\n"
+        f"Дата: {date.strftime('%d.%m.%Y')}\n"
         f"Время: {booking['time']}"
     )
 
@@ -289,7 +317,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Новая запись!\n\n"
         f"Имя: {booking['name']}\n"
         f"Телефон: {booking['phone']}\n"
-        f"Дата: {date_text(date)}\n"
+        f"Дата: {date.strftime('%d.%m.%Y')}\n"
         f"Время: {booking['time']}\n"
         f"Telegram: {username}"
     )
@@ -353,7 +381,7 @@ async def all_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += (
             f"{index}. {booking['name']}\n"
             f"Телефон: {booking['phone']}\n"
-            f"Дата: {date_text(date)}\n"
+            f"Дата: {date.strftime('%d.%m.%Y')}\n"
             f"Время: {booking['time']}\n\n"
         )
 
@@ -424,8 +452,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "book":
         await book(update, context)
 
-    elif data == "more_dates":
-        await more_dates(update, context)
+    elif data.startswith("calendar_"):
+        await change_month(update, context)
 
     elif data.startswith("date_"):
         await choose_date(update, context)
@@ -441,6 +469,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_list":
         await admin_list(update, context)
+
+    elif data == "ignore":
+        await query.answer()
 
 
 def main():
