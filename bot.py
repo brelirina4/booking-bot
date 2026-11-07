@@ -260,68 +260,79 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text("Напиши своё имя:")
 
 
-async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("booking_step") != "name":
-        return
-
-    context.user_data["booking_name"] = update.message.text
-    context.user_data["booking_step"] = "phone"
-
-    await update.message.reply_text("Теперь отправь свой номер телефона:")
-
-
-async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("booking_step") != "phone":
-        return
-
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    text = update.message.text.strip()
+    step = context.user_data.get("booking_step")
 
-    booking = {
-        "user_id": user.id,
-        "username": user.username,
-        "name": context.user_data["booking_name"],
-        "phone": update.message.text,
-        "date": context.user_data["booking_date"],
-        "time": context.user_data["booking_time"],
-    }
+    if step == "name":
+        context.user_data["booking_name"] = text
+        context.user_data["booking_step"] = "phone"
 
-    BOOKINGS.append(booking)
-    save_data()
+        await update.message.reply_text("Теперь отправь свой номер телефона:")
+        return
 
-    context.user_data["booking_step"] = None
+    if step == "phone":
+        booking = {
+            "user_id": user.id,
+            "username": user.username,
+            "name": context.user_data["booking_name"],
+            "phone": text,
+            "date": context.user_data["booking_date"],
+            "time": context.user_data["booking_time"],
+        }
 
-    date = datetime.strptime(booking["date"], "%Y-%m-%d").date()
+        BOOKINGS.append(booking)
+        save_data()
 
-    await update.message.reply_text(
-        f"✅ Запись создана!\n\n"
-        f"Имя: {booking['name']}\n"
-        f"Телефон: {booking['phone']}\n"
-        f"Дата: {date.strftime('%d.%m.%Y')}\n"
-        f"Время: {booking['time']}"
-    )
+        context.user_data["booking_step"] = None
 
-    username = f"@{user.username}" if user.username else "не указан"
+        date = datetime.strptime(booking["date"], "%Y-%m-%d").date()
 
-    notification = (
-        f"Новая запись!\n\n"
-        f"Имя: {booking['name']}\n"
-        f"Телефон: {booking['phone']}\n"
-        f"Дата: {date.strftime('%d.%m.%Y')}\n"
-        f"Время: {booking['time']}\n"
-        f"Telegram: {username}"
-    )
+        await update.message.reply_text(
+            f"✅ Запись создана!\n\n"
+            f"Имя: {booking['name']}\n"
+            f"Телефон: {booking['phone']}\n"
+            f"Дата: {date.strftime('%d.%m.%Y')}\n"
+            f"Время: {booking['time']}"
+        )
 
-    if OWNER_ID:
-        try:
-            await context.bot.send_message(OWNER_ID, notification)
-        except Exception as error:
-            logger.error(f"Не удалось отправить уведомление владельцу: {error}")
+        username = f"@{user.username}" if user.username else "не указан"
 
-    for admin_id in ADMINS:
-        try:
-            await context.bot.send_message(admin_id, notification)
-        except Exception as error:
-            logger.error(f"Не удалось отправить уведомление админу: {error}")
+        notification = (
+            f"Новая запись!\n\n"
+            f"Имя: {booking['name']}\n"
+            f"Телефон: {booking['phone']}\n"
+            f"Дата: {date.strftime('%d.%m.%Y')}\n"
+            f"Время: {booking['time']}\n"
+            f"Telegram: {username}"
+        )
+
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(OWNER_ID, notification)
+            except Exception as error:
+                logger.error(f"Не удалось отправить уведомление владельцу: {error}")
+
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_message(admin_id, notification)
+            except Exception as error:
+                logger.error(f"Не удалось отправить уведомление админу: {error}")
+
+        return
+
+    if context.user_data.get("admin_step") == "username":
+        if not text.startswith("@"):
+            await update.message.reply_text("Отправь username в формате @username.")
+            return
+
+        context.user_data["admin_step"] = None
+
+        await update.message.reply_text(
+            "Попроси этого человека открыть бота и нажать Start.\n\n"
+            "После этого снова нажми «Добавить админа» и отправь его @username."
+        )
 
 
 async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,24 +389,6 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text(
         "Отправь @username человека, которого хочешь сделать админом."
-    )
-
-
-async def get_admin_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("admin_step") != "username":
-        return
-
-    username = update.message.text.strip()
-
-    if not username.startswith("@"):
-        await update.message.reply_text("Отправь username в формате @username.")
-        return
-
-    context.user_data["admin_step"] = None
-
-    await update.message.reply_text(
-        "Попроси этого человека открыть бота и нажать Start.\n\n"
-        "После этого снова нажми «Добавить админа» и отправь его @username."
     )
 
 
@@ -474,21 +467,7 @@ def main():
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            get_name,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            get_phone,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            get_admin_username,
+            handle_text,
         )
     )
 
