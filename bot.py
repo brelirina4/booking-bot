@@ -21,6 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь переменную BOT_TOKEN в Railway -> Variables."
+    )
+
 DATA_FILE = "data.json"
 
 OWNER_ID = None
@@ -76,8 +82,7 @@ def get_dates():
     today = datetime.now().date()
 
     for day in range(14):
-        date = today + timedelta(days=day)
-        dates.append(date)
+        dates.append(today + timedelta(days=day))
 
     return dates
 
@@ -100,11 +105,11 @@ def get_free_times(date):
     if date.isoformat() in CLOSED_DAYS:
         return []
 
-    booked_times = []
-
-    for booking in BOOKINGS:
-        if booking["date"] == date.isoformat():
-            booked_times.append(booking["time"])
+    booked_times = [
+        booking["time"]
+        for booking in BOOKINGS
+        if booking["date"] == date.isoformat()
+    ]
 
     free_times = []
 
@@ -119,6 +124,8 @@ def get_free_times(date):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global OWNER_ID
+
     user = update.effective_user
 
     if OWNER_ID is None:
@@ -207,9 +214,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free_times = get_free_times(date)
 
     if not free_times:
-        await query.message.reply_text(
-            "На этот день нет свободного времени."
-        )
+        await query.message.reply_text("На этот день нет свободного времени.")
         return
 
     keyboard = []
@@ -278,13 +283,15 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Время: {booking['time']}"
     )
 
+    username = f"@{user.username}" if user.username else "не указан"
+
     notification = (
         f"Новая запись!\n\n"
         f"Имя: {booking['name']}\n"
         f"Телефон: {booking['phone']}\n"
         f"Дата: {date_text(date)}\n"
         f"Время: {booking['time']}\n"
-        f"Telegram: @{user.username}" if user.username else ""
+        f"Telegram: {username}"
     )
 
     if OWNER_ID:
@@ -368,9 +375,7 @@ async def get_admin_username(update: Update, context: ContextTypes.DEFAULT_TYPE)
     username = update.message.text.strip()
 
     if not username.startswith("@"):
-        await update.message.reply_text(
-            "Отправь username в формате @username."
-        )
+        await update.message.reply_text("Отправь username в формате @username.")
         return "WAIT_USERNAME"
 
     await update.message.reply_text(
@@ -398,6 +403,8 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global OWNER_ID
+
     user = update.effective_user
 
     if OWNER_ID is None:
@@ -422,9 +429,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("date_"):
         await choose_date(update, context)
-
-    elif data.startswith("time_"):
-        await choose_time(update, context)
 
     elif data == "owner_panel":
         await owner_panel(update, context)
@@ -459,6 +463,7 @@ def main():
     )
 
     application.add_handler(conv_handler)
+
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
